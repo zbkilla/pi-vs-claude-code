@@ -107,6 +107,7 @@ interface SendRequest {
 	target: string;
 	target_session: string | null;
 	prompt: string;
+	summary?: string | null;
 	conversation_id: string | null;
 	response_schema: object | null;
 	hops: number;
@@ -682,7 +683,11 @@ export default function (pi: ExtensionAPI) {
 			// pi↔CC conversations look the same regardless of which side reads them.
 			// Reply guidance is intentionally one short line — the coms_net_send
 			// tool description carries the full warning.
-			const summary = promptText.replace(/\n/g, " ").slice(0, 200);
+			// Prefer the sender-supplied summary; auto-slice the prompt as fallback.
+			const senderSummary = typeof data.summary === "string" && data.summary.length > 0
+				? data.summary.slice(0, 200)
+				: null;
+			const summary = senderSummary ?? promptText.replace(/\n/g, " ").slice(0, 200);
 			const channelTag =
 				`<channel source="coms-net" sender="${senderName}" ` +
 				`msg_id="${msg_id}" thread="${senderSession}" ` +
@@ -1258,6 +1263,13 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			target: Type.String({ description: "Peer name (preferred, scoped to your project) or session_id." }),
 			prompt: Type.String({ description: "The prompt to send." }),
+			summary: Type.Optional(Type.String({
+				description:
+					"Optional ≤200-char one-line summary the receiver can use in the <channel summary=…> attribute. " +
+					"When omitted, receivers auto-slice the first 200 chars of `prompt`. " +
+					"Write a real summary when your prompt is long or its first 200 chars don't capture the intent.",
+				maxLength: 200,
+			})),
 			conversation_id: Type.Optional(Type.String()),
 			response_schema: Type.Optional(Type.Any({ description: "Optional JSON Schema describing the expected response shape." })),
 		}),
@@ -1275,6 +1287,10 @@ export default function (pi: ExtensionAPI) {
 				target: params.target,
 				target_session: null,
 				prompt: params.prompt,
+				summary:
+					typeof (params as any).summary === "string" && (params as any).summary.length > 0
+						? ((params as any).summary as string).slice(0, 200)
+						: null,
 				conversation_id: (params as any).conversation_id ?? null,
 				response_schema: ((params as any).response_schema as object | undefined) ?? null,
 				hops,

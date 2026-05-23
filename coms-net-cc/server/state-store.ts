@@ -66,6 +66,8 @@ export interface InboxEntry {
 	sender_name: string;
 	sender_cwd: string;
 	prompt: string;
+	/** Sender-supplied summary (≤200 chars) or null. */
+	summary: string | null;
 	hops: number;
 	response_schema: object | null;
 	received_at: string;

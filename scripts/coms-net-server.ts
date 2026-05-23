@@ -164,6 +164,9 @@ export type ComsMessage = {
 	sender_session: string;
 	target_session: string;
 	prompt: string;
+	/** Optional author-supplied summary. When absent, receivers fall back to
+	 *  prompt.slice(0,200). Used in the <channel summary="..."> attribute. */
+	summary: string | null;
 	conversation_id: string | null;
 	response_schema: object | null;
 	hops: number;
@@ -209,6 +212,9 @@ export type SendRequest = {
 	target: string;
 	target_session: string | null;
 	prompt: string;
+	/** Optional author-written summary (≤200 chars). Receivers prefer this over
+	 *  the auto-sliced prompt body when rendering <channel summary="..."> */
+	summary?: string | null;
 	conversation_id: string | null;
 	response_schema: object | null;
 	hops: number;
@@ -897,6 +903,10 @@ async function handleSendMessage(req: Request): Promise<Response> {
 		sender_session: body.sender_session,
 		target_session: target.session_id,
 		prompt: body.prompt,
+		summary:
+			typeof body.summary === "string" && body.summary.length > 0
+				? body.summary.slice(0, 200)
+				: null,
 		conversation_id:
 			body.conversation_id && typeof body.conversation_id === "string"
 				? body.conversation_id
@@ -932,6 +942,7 @@ async function handleSendMessage(req: Request): Promise<Response> {
 				cwd: sender.cwd,
 			},
 			prompt: msg.prompt,
+			summary: msg.summary,
 			conversation_id: msg.conversation_id,
 			response_schema: msg.response_schema,
 			hops: msg.hops,

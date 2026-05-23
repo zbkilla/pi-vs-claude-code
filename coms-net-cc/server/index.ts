@@ -259,6 +259,10 @@ function handleInboundPrompt(data: any): void {
 		sender_name: typeof sender.name === "string" ? sender.name : "unknown",
 		sender_cwd: typeof sender.cwd === "string" ? sender.cwd : "?",
 		prompt: typeof data.prompt === "string" ? data.prompt : "",
+		summary:
+			typeof data.summary === "string" && data.summary.length > 0
+				? data.summary.slice(0, 200)
+				: null,
 		hops: typeof data.hops === "number" ? data.hops : 0,
 		response_schema:
 			data.response_schema && typeof data.response_schema === "object"
@@ -362,7 +366,8 @@ async function pushChannel(entry: InboxEntry): Promise<boolean> {
 					sender: entry.sender_name,
 					thread: entry.sender_session,
 					msg_id: entry.msg_id,
-					summary: entry.prompt.slice(0, 200),
+					// Prefer sender-supplied summary; fall back to auto-sliced prompt.
+					summary: entry.summary ?? entry.prompt.slice(0, 200),
 				},
 			},
 		});
@@ -457,11 +462,16 @@ server.registerTool(
 		inputSchema: {
 			target: z.string().describe("Peer name (preferred) or session_id."),
 			prompt: z.string().describe("The prompt to send."),
+			summary: z.string().max(200).optional().describe(
+				"Optional ≤200-char one-line summary the receiver renders in <channel summary=…>. " +
+				"When omitted, receivers auto-slice the first 200 chars of `prompt`. " +
+				"Write a real summary when `prompt` is long or its first 200 chars don't capture the intent.",
+			),
 			conversation_id: z.string().optional(),
 			response_schema: z.any().optional(),
 		},
 	},
-	async ({ target, prompt, conversation_id, response_schema }) => {
+	async ({ target, prompt, summary, conversation_id, response_schema }) => {
 		if (!hub) return notReady();
 		const hops = 0; // CC doesn't track inbound-chain hops yet; v1 keeps it simple.
 		if (hops >= MAX_HOPS) {
@@ -477,6 +487,7 @@ server.registerTool(
 				target,
 				target_session: null,
 				prompt,
+				summary: typeof summary === "string" && summary.length > 0 ? summary.slice(0, 200) : null,
 				conversation_id: conversation_id ?? null,
 				response_schema: (response_schema as object | undefined) ?? null,
 				hops,

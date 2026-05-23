@@ -135,6 +135,7 @@ export interface SendRequest {
 	target: string;
 	target_session: string | null;
 	prompt: string;
+	summary?: string | null;
 	conversation_id: string | null;
 	response_schema: object | null;
 	hops: number;
