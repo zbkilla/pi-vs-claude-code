@@ -43,7 +43,9 @@ const MAX_HOPS = Number(process.env.PI_COMS_NET_MAX_HOPS) || 5;
 const DEFAULT_AWAIT_TIMEOUT_MS = Number(process.env.PI_COMS_NET_MESSAGE_TTL_MS) || 1_800_000;
 
 const identity = resolveIdentity(process.cwd());
-const stateDir = ensureStateDir(process.cwd());
+// identity.cwd is the project root (resolved via marketplace.json walk-up)
+// — use it as the state-dir key so hooks find the same dir.
+const stateDir = ensureStateDir(identity.cwd);
 
 // Best-effort log file for the MCP server. Hooks log to errors.log separately.
 function log(event: string, extra: Record<string, unknown> = {}): void {

@@ -16,6 +16,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -93,8 +94,34 @@ export interface Identity {
 	model: string;
 }
 
+/**
+ * Find the project root by walking up from this file's location until we hit
+ * `.claude-plugin/marketplace.json` (the marker for our pi-vs-cc marketplace).
+ * Falls back to the supplied cwd if nothing is found within 6 levels.
+ *
+ * Necessary because when the MCP server is spawned via the fakechat plugin
+ * substitution, process.cwd() ends up being fakechat's directory — not the
+ * repo where the user's project-local .claude/coms-net-cc.local.md lives.
+ * import.meta.url always points to THIS file inside the plugin tree, so it
+ * gives us a stable anchor.
+ */
+function findProjectRoot(fallbackCwd: string): string {
+	let dir: string;
+	try { dir = path.dirname(fileURLToPath(import.meta.url)); }
+	catch { return fallbackCwd; }
+	for (let i = 0; i < 6; i++) {
+		const marker = path.join(dir, ".claude-plugin", "marketplace.json");
+		if (fs.existsSync(marker)) return dir;
+		const parent = path.dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	return fallbackCwd;
+}
+
 export function resolveIdentity(cwd: string): Identity {
-	const projectFm = readFrontmatterFile(path.join(cwd, ".claude", "coms-net-cc.local.md"));
+	const projectRoot = findProjectRoot(cwd);
+	const projectFm = readFrontmatterFile(path.join(projectRoot, ".claude", "coms-net-cc.local.md"));
 	const globalFm = readFrontmatterFile(path.join(os.homedir(), ".claude", "coms-net-cc.local.md"));
 	const env = process.env;
 
@@ -132,7 +159,9 @@ export function resolveIdentity(cwd: string): Identity {
 		color,
 		project,
 		explicit,
-		cwd,
+		// Use projectRoot (not the raw cwd) so the state dir keys match the
+		// `cwd` field CC's hooks receive (always the user's project root).
+		cwd: projectRoot,
 		model: "claude-code",
 	};
 }
