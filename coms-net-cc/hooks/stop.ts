@@ -173,9 +173,32 @@ async function main(): Promise<void> {
 	pulse(stateDir);
 
 	const transcriptPath = input.transcript_path;
-	const transcript = transcriptPath && fs.existsSync(transcriptPath)
+
+	// Race tolerance: CC fires Stop very close to (sometimes ~100ms after) the
+	// assistant message hitting disk. If we have inbox entries from channel
+	// pushes, briefly re-poll the transcript until either (a) every channel'd
+	// msg_id has a following assistant text, or (b) we've waited ~750ms.
+	const inboxMsgIds = new Set(
+		listInbox(stateDir).map((f) => path.basename(f, ".json")),
+	);
+	const RETRY_MS = 200;
+	const MAX_WAIT_MS = 750;
+	let transcript = transcriptPath && fs.existsSync(transcriptPath)
 		? loadTranscript(transcriptPath)
 		: [];
+	let waited = 0;
+	while (waited < MAX_WAIT_MS && inboxMsgIds.size > 0) {
+		const { replies, seenMsgIds } = findChannelReplies(transcript);
+		const channeledInboxes = [...inboxMsgIds].filter((m) => seenMsgIds.has(m));
+		if (channeledInboxes.length === 0) break; // no channel-pushed entries to wait on
+		const allHaveReplies = channeledInboxes.every((m) => replies.has(m));
+		if (allHaveReplies) break;
+		await new Promise((r) => setTimeout(r, RETRY_MS));
+		waited += RETRY_MS;
+		transcript = transcriptPath && fs.existsSync(transcriptPath)
+			? loadTranscript(transcriptPath)
+			: [];
+	}
 
 	// ── 1a. CLOSE old-style inflight (fakechat decision:block path):
 	// the response is whatever the LAST assistant message says.
