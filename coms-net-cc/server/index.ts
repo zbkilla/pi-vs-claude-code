@@ -74,6 +74,10 @@ interface PendingReply {
 	target_name?: string;
 	target_session?: string;
 	created_at: string;
+	/** Set true when coms_net_await consumes the reply, so the auto-deliver
+	 *  channel push is suppressed (avoids the LLM seeing the same reply twice
+	 *  — once as a tool result, once as an inline <channel> turn). */
+	consumedByAwait?: boolean;
 }
 const pendingReplies = new Map<string, PendingReply>();
 
@@ -278,16 +282,36 @@ function handleInboundResponse(data: any): void {
 	const msg_id: string | undefined = data?.msg_id;
 	if (!msg_id) return;
 	const pending = pendingReplies.get(msg_id);
+	const errVal: string | null = typeof data.error === "string" ? data.error : null;
+	const responseVal = data.response;
 	if (pending) {
-		const result = {
-			response: data.response,
-			error: typeof data.error === "string" ? data.error : null,
-		};
-		try { pending.resolve(result); } catch { /* ignore */ }
-		log("response_in", { msg_id, error: result.error });
+		try { pending.resolve({ response: responseVal, error: errVal }); } catch { /* ignore */ }
+		log("response_in", { msg_id, error: errVal });
 	} else {
 		log("orphan_response", { msg_id });
 	}
+
+	// Auto-deliver the reply as a claude/channel push so the LLM sees it
+	// inline without an explicit coms_net_await. Suppress when:
+	//   • the response is an error (no useful body to render), OR
+	//   • coms_net_await has consumed (or will consume) the reply.
+	// 150ms defer gives a racing await call time to flip the flag.
+	if (errVal) return;
+	if (pending?.consumedByAwait) return;
+	const responderName =
+		(data?.responder && typeof data.responder.name === "string")
+			? data.responder.name
+			: (pending?.target_name ?? "peer");
+	const bodyText = typeof responseVal === "string"
+		? responseVal
+		: (responseVal != null ? JSON.stringify(responseVal, null, 2) : "");
+	if (!bodyText) return;
+	setTimeout(() => {
+		const stillPending = pendingReplies.get(msg_id);
+		if (stillPending?.consumedByAwait) return;
+		pushReplyChannel(msg_id, responderName, bodyText)
+			.then((ok) => { if (ok) log("reply_pushed", { msg_id }); });
+	}, 150);
 }
 
 // ━━ MCP server + tools ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -343,6 +367,39 @@ async function pushChannel(entry: InboxEntry): Promise<boolean> {
 		return true;
 	} catch (err) {
 		log("channel_push_failed", { msg_id: entry.msg_id, error: String(err) });
+		return false;
+	}
+}
+
+/**
+ * Push a peer's reply (to a coms_net_send WE made) as a claude/channel event
+ * so it appears inline in CC without requiring an explicit coms_net_await.
+ * The reply body becomes the <channel> content; meta.reply_to carries the
+ * original outbound msg_id so the LLM can distinguish replies from new
+ * inbound prompts.
+ */
+async function pushReplyChannel(
+	originalMsgId: string,
+	senderName: string,
+	body: string,
+): Promise<boolean> {
+	if (!mcpInitialized) return false;
+	try {
+		await server.server.notification({
+			method: "notifications/claude/channel",
+			params: {
+				content: body,
+				meta: {
+					sender: senderName,
+					reply_to: originalMsgId,
+					msg_id: originalMsgId,
+					summary: body.slice(0, 200),
+				},
+			},
+		});
+		return true;
+	} catch (err) {
+		log("reply_push_failed", { msg_id: originalMsgId, error: String(err) });
 		return false;
 	}
 }
@@ -512,8 +569,13 @@ server.registerTool(
 			? timeout_ms
 			: DEFAULT_AWAIT_TIMEOUT_MS;
 
-		// Fast path: SSE-resolved (will work after task 11).
+		// Fast path: SSE-resolved.
 		const pending = pendingReplies.get(msg_id);
+		if (pending) {
+			// Mark consumed so handleInboundResponse's deferred channel push
+			// is suppressed (avoids double-delivery to the LLM).
+			pending.consumedByAwait = true;
+		}
 		if (pending?.promise) {
 			// Race local promise against server long-poll + timeout.
 			const ac = new AbortController();
