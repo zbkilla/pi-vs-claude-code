@@ -20,8 +20,8 @@ import * as path from "node:path";
 import {
 	stateDirFor,
 	readIdentity,
+	listInbox,
 	listInflight,
-	claimNextInbound,
 	clearInflight,
 	pulse,
 	appendErrorLog,
@@ -58,30 +58,73 @@ async function readStdin(): Promise<string> {
 	return Buffer.concat(chunks).toString("utf-8");
 }
 
-function extractLastAssistantText(transcriptPath: string): string {
-	let raw: string;
-	try {
-		raw = fs.readFileSync(transcriptPath, "utf-8");
-	} catch {
-		return "";
+function extractAssistantText(message: any): string {
+	if (!message || message.role !== "assistant") return "";
+	if (Array.isArray(message.content)) {
+		return message.content
+			.filter((b: any) => b?.type === "text" && typeof b.text === "string")
+			.map((b: any) => b.text)
+			.join("\n");
 	}
-	const lines = raw.split("\n").filter(Boolean);
-	for (let i = lines.length - 1; i >= 0; i--) {
-		let entry: any;
-		try { entry = JSON.parse(lines[i]); } catch { continue; }
-		const m = entry?.message;
-		if (!m || m.role !== "assistant") continue;
-		if (Array.isArray(m.content)) {
-			const text = m.content
-				.filter((b: any) => b?.type === "text" && typeof b.text === "string")
-				.map((b: any) => b.text)
-				.join("\n");
-			if (text.length > 0) return text;
-		} else if (typeof m.content === "string") {
-			return m.content;
-		}
+	if (typeof message.content === "string") return message.content;
+	return "";
+}
+
+function loadTranscript(transcriptPath: string): any[] {
+	let raw: string;
+	try { raw = fs.readFileSync(transcriptPath, "utf-8"); }
+	catch { return []; }
+	return raw.split("\n").filter(Boolean).map((line) => {
+		try { return JSON.parse(line); } catch { return null; }
+	}).filter(Boolean);
+}
+
+function extractLastAssistantText(transcript: any[]): string {
+	for (let i = transcript.length - 1; i >= 0; i--) {
+		const text = extractAssistantText(transcript[i]?.message);
+		if (text) return text;
 	}
 	return "";
+}
+
+/**
+ * Scan transcript for user-role messages that contain channel events the MCP
+ * server pushed via notifications/claude/channel. For each one, find the
+ * assistant text that follows (the inline reply). Returns map: msg_id → reply.
+ *
+ * Channel events appear in the JSONL as user messages whose text content
+ * matches `<channel ... msg_id="X" ...>body</channel>` (per the team-bus
+ * pattern documented at /root/agent-view-teams).
+ */
+function findChannelReplies(transcript: any[]): {
+	replies: Map<string, string>;
+	seenMsgIds: Set<string>;
+} {
+	const replies = new Map<string, string>();
+	const seenMsgIds = new Set<string>();
+	const channelMsgIdRe = /<channel\b[^>]*\bmsg_id="([^"]+)"[^>]*>/;
+	for (let i = 0; i < transcript.length; i++) {
+		const entry = transcript[i];
+		const m = entry?.message;
+		if (!m || m.role !== "user") continue;
+		const userText = Array.isArray(m.content)
+			? m.content.map((b: any) => (typeof b?.text === "string" ? b.text : "")).join("\n")
+			: (typeof m.content === "string" ? m.content : "");
+		const match = userText.match(channelMsgIdRe);
+		if (!match) continue;
+		const msgId = match[1];
+		seenMsgIds.add(msgId);
+		for (let j = i + 1; j < transcript.length; j++) {
+			const next = transcript[j]?.message;
+			if (next?.role !== "assistant") continue;
+			const text = extractAssistantText(next);
+			if (text) {
+				replies.set(msgId, text);
+				break;
+			}
+		}
+	}
+	return { replies, seenMsgIds };
 }
 
 async function postResponse(
@@ -129,36 +172,77 @@ async function main(): Promise<void> {
 
 	pulse(stateDir);
 
-	// ── 1. CLOSE in-flight inbounds. Runs regardless of stop_hook_active.
 	const transcriptPath = input.transcript_path;
-	if (transcriptPath && fs.existsSync(transcriptPath)) {
-		const lastText = extractLastAssistantText(transcriptPath);
+	const transcript = transcriptPath && fs.existsSync(transcriptPath)
+		? loadTranscript(transcriptPath)
+		: [];
+
+	// ── 1a. CLOSE old-style inflight (fakechat decision:block path):
+	// the response is whatever the LAST assistant message says.
+	if (transcript.length > 0) {
+		const lastText = extractLastAssistantText(transcript);
 		for (const filePath of listInflight(stateDir)) {
 			const entry = readJson<InflightEntry>(filePath);
-			if (!entry) {
-				clearInflight(filePath);
-				continue;
-			}
+			if (!entry) { clearInflight(filePath); continue; }
 			const result = await postResponse(identity, entry.msg_id, lastText, null);
 			if (!result.ok) {
 				appendErrorLog(
 					stateDir,
-					`response POST failed for ${entry.msg_id}: HTTP ${result.status} ${result.detail ?? ""}`,
+					`response POST (inflight) failed for ${entry.msg_id}: HTTP ${result.status} ${result.detail ?? ""}`,
 				);
 			}
 			clearInflight(filePath);
 		}
 	}
 
-	// ── 2. DELIVER next inbound — unless deferring.
+	// ── 1b. CLOSE channel-pushed inbox entries: walk the transcript for
+	// <channel msg_id="X"> events and submit the assistant text following each
+	// one. Then delete the corresponding inbox file.
+	const channelInfo = transcript.length > 0
+		? findChannelReplies(transcript)
+		: { replies: new Map<string, string>(), seenMsgIds: new Set<string>() };
+	if (channelInfo.replies.size > 0) {
+		for (const inboxPath of listInbox(stateDir)) {
+			const msgId = path.basename(inboxPath, ".json");
+			const reply = channelInfo.replies.get(msgId);
+			if (!reply) continue;
+			const result = await postResponse(identity, msgId, reply, null);
+			if (!result.ok) {
+				appendErrorLog(
+					stateDir,
+					`response POST (channel) failed for ${msgId}: HTTP ${result.status} ${result.detail ?? ""}`,
+				);
+			}
+			try { fs.unlinkSync(inboxPath); } catch { /* idempotent */ }
+		}
+	}
+
+	// ── 2. FAKECHAT FALLBACK: inbox entries the channel push did NOT reach
+	// at all (Claude has never seen them) get the decision:block treatment.
+	// Skip any inbox file whose msg_id appears as a channel event in the
+	// transcript — Claude has already seen it; just wait for the reply.
 	if (input.stop_hook_active === true) {
-		// Defer: drain on the next natural Stop instead of chaining.
 		process.exit(0);
 	}
 
-	const claim = claimNextInbound(stateDir);
+	// Pick the oldest inbox file whose msg_id has NOT yet been delivered via
+	// channel push (otherwise we'd double-deliver — Claude already saw it).
+	const candidateFiles = listInbox(stateDir)
+		.map((f) => ({ f, mtime: fs.statSync(f).mtimeMs }))
+		.sort((a, b) => a.mtime - b.mtime)
+		.map(({ f }) => f);
+	let claim: { entry: InboxEntry; inflightPath: string } | null = null;
+	for (const f of candidateFiles) {
+		const msgId = path.basename(f, ".json");
+		if (channelInfo.seenMsgIds.has(msgId)) continue;
+		const target = path.join(stateDir, "inflight", `${msgId}.json`);
+		try { fs.renameSync(f, target); } catch { continue; }
+		const entry = readJson<InboxEntry>(target);
+		if (!entry) { try { fs.unlinkSync(target); } catch { /* ignore */ } continue; }
+		claim = { entry, inflightPath: target };
+		break;
+	}
 	if (!claim) {
-		// Inbox empty — let CC stop normally.
 		process.exit(0);
 	}
 
