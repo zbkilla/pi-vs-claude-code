@@ -68,6 +68,10 @@ export interface InboxEntry {
 	prompt: string;
 	/** Sender-supplied summary (≤200 chars) or null. */
 	summary: string | null;
+	/** Sender peer-state snapshot from the hub at send time. */
+	sender_context_pct?: number;
+	sender_status?: "online" | "stale" | "offline";
+	sender_observed_age_ms?: number;
 	hops: number;
 	response_schema: object | null;
 	received_at: string;

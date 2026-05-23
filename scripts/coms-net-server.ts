@@ -225,6 +225,11 @@ export type SendResponse = {
 	msg_id: string;
 	status: MessageStatus;
 	target_session: string;
+	/** Target peer's health snapshot at send time. Sender uses these to decide
+	 *  whether to retry with a different peer or trim the prompt. */
+	target_context_pct: number;
+	target_status: AgentStatus;
+	target_observed_age_ms: number;
 };
 
 export type ResponseSubmitRequest = {
@@ -423,6 +428,30 @@ function nameIndexRemove(
 	if (!bag) return;
 	bag.delete(sessionId);
 	if (bag.size === 0) p.nameIndex.delete(name);
+}
+
+/**
+ * Snapshot of a peer's health/capacity for stamping on outbound events.
+ * Receivers render these as <channel ... peer_context_pct="83" peer_status="..."
+ * peer_observed_age_ms="2400">. Orthogonal encoding (per CC peer's design
+ * preference) — no "constrained" boolean; receivers derive thresholds.
+ */
+export type AgentStateSnapshot = {
+	context_pct: number;
+	status: AgentStatus;
+	observed_age_ms: number;
+};
+
+function agentState(e: RegistryEntry): AgentStateSnapshot {
+	const lastSeenMs = Date.parse(e.last_seen_at);
+	const observed_age_ms = Number.isFinite(lastSeenMs)
+		? Math.max(0, Date.now() - lastSeenMs)
+		: 0;
+	return {
+		context_pct: typeof e.context_used_pct === "number" ? e.context_used_pct : 0,
+		status: e.status,
+		observed_age_ms,
+	};
 }
 
 function entryToCard(e: RegistryEntry): AgentCard {
@@ -930,6 +959,12 @@ async function handleSendMessage(req: Request): Promise<Response> {
 		status: "queued",
 	});
 
+	// Snapshot sender state to stamp on the SSE prompt event (lets the receiver
+	// know the asker's headroom — the "(a) sender state on inbound" half of the
+	// peer-health design). Snapshot target state for the SendResponse below.
+	const senderState = agentState(sender);
+	const targetState = agentState(target);
+
 	// Emit prompt to target if its stream is open.
 	const targetWriter = p.streams.get(target.session_id);
 	if (targetWriter) {
@@ -940,6 +975,9 @@ async function handleSendMessage(req: Request): Promise<Response> {
 				session_id: sender.session_id,
 				name: sender.name,
 				cwd: sender.cwd,
+				context_pct: senderState.context_pct,
+				status: senderState.status,
+				observed_age_ms: senderState.observed_age_ms,
 			},
 			prompt: msg.prompt,
 			summary: msg.summary,
@@ -970,6 +1008,9 @@ async function handleSendMessage(req: Request): Promise<Response> {
 		msg_id: msg.msg_id,
 		status: msg.status,
 		target_session: target.session_id,
+		target_context_pct: targetState.context_pct,
+		target_status: targetState.status,
+		target_observed_age_ms: targetState.observed_age_ms,
 	};
 	return json(resp);
 }
@@ -1159,15 +1200,27 @@ async function handleSubmitResponse(
 	msg.error = isError ? String(body.error) : null;
 	msg.completed_at = nowIso();
 
-	// Look up responder name for the SSE response payload.
+	// Look up responder name + health snapshot for the SSE response payload.
+	// Receivers render responder_context_pct on the auto-delivered reply
+	// <channel> so the sender knows whether the answer came from a peer at 80%
+	// context (probably terse/degraded) vs one at 10% (probably thorough).
 	const responder = project.agents.get(body.responder_session);
 	const responderName = responder?.name ?? "unknown";
+	const responderState = responder
+		? agentState(responder)
+		: { context_pct: 0, status: "offline" as AgentStatus, observed_age_ms: 0 };
 
 	// Notify sender (if its stream is open).
 	sendToStream(project, msg.sender_session, "response", {
 		msg_id: msg.msg_id,
 		project: msg.project,
-		responder: { session_id: body.responder_session, name: responderName },
+		responder: {
+			session_id: body.responder_session,
+			name: responderName,
+			context_pct: responderState.context_pct,
+			status: responderState.status,
+			observed_age_ms: responderState.observed_age_ms,
+		},
 		response: msg.response,
 		error: msg.error,
 		status: msg.status,

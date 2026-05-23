@@ -117,6 +117,9 @@ interface SendResponse {
 	ok: true;
 	msg_id: string;
 	status: MessageStatus;
+	target_context_pct?: number;
+	target_status?: AgentStatus;
+	target_observed_age_ms?: number;
 	target_session: string;
 }
 
@@ -688,9 +691,16 @@ export default function (pi: ExtensionAPI) {
 				? data.summary.slice(0, 200)
 				: null;
 			const summary = senderSummary ?? promptText.replace(/\n/g, " ").slice(0, 200);
+			// Hub stamps sender peer-state on the SSE prompt event for routing
+			// awareness. Render as attributes when present so receivers can read
+			// raw values (per the orthogonal-encoding design).
+			const sCtx = typeof sender.context_pct === "number" ? ` sender_context_pct="${sender.context_pct}"` : "";
+			const sStatus = typeof sender.status === "string" ? ` sender_status="${sender.status}"` : "";
+			const sAge = typeof sender.observed_age_ms === "number" ? ` sender_observed_age_ms="${sender.observed_age_ms}"` : "";
 			const channelTag =
 				`<channel source="coms-net" sender="${senderName}" ` +
-				`msg_id="${msg_id}" thread="${senderSession}" ` +
+				`msg_id="${msg_id}" thread="${senderSession}"` +
+				sCtx + sStatus + sAge + ` ` +
 				`summary="${summary.replace(/"/g, "&quot;")}">\n${promptText}\n</channel>`;
 			pi.sendMessage(
 				{
@@ -770,18 +780,25 @@ export default function (pi: ExtensionAPI) {
 		pending: PendingReply | undefined,
 		data: any,
 	): void {
-		const responderName =
-			(data?.responder && typeof data.responder.name === "string")
-				? data.responder.name
-				: (pending?.target_name ?? "peer");
+		const responder = data?.responder ?? {};
+		const responderName = typeof responder.name === "string"
+			? responder.name
+			: (pending?.target_name ?? "peer");
 		const bodyText = typeof responseVal === "string"
 			? responseVal
 			: (responseVal != null ? JSON.stringify(responseVal, null, 2) : "");
 		if (!bodyText) return;
 		const summary = bodyText.replace(/\n/g, " ").slice(0, 200);
+		// Hub stamps responder peer-state on the SSE response event — render
+		// inline so the original sender knows whether the answer came from a
+		// healthy peer or a context-full one. Highest-value signal in the design.
+		const rCtx = typeof responder.context_pct === "number" ? ` responder_context_pct="${responder.context_pct}"` : "";
+		const rStatus = typeof responder.status === "string" ? ` responder_status="${responder.status}"` : "";
+		const rAge = typeof responder.observed_age_ms === "number" ? ` responder_observed_age_ms="${responder.observed_age_ms}"` : "";
 		const channelTag =
 			`<channel source="coms-net" sender="${responderName}" ` +
-			`reply_to="${msg_id}" summary="${summary.replace(/"/g, "&quot;")}">\n${bodyText}\n</channel>`;
+			`reply_to="${msg_id}"` + rCtx + rStatus + rAge +
+			` summary="${summary.replace(/"/g, "&quot;")}">\n${bodyText}\n</channel>`;
 		try {
 			pi.sendMessage(
 				{
@@ -1335,12 +1352,26 @@ export default function (pi: ExtensionAPI) {
 				});
 			} catch { /* best-effort */ }
 
+			// Surface target peer-state in the tool result so the LLM gets the
+			// "I just routed into a 90% peer" signal immediately. Per the design
+			// synthesis: this is the decision-gating half.
+			const stateLine = typeof resp.target_context_pct === "number"
+				? `\ntarget_state ${resp.target_status ?? "?"} ctx=${resp.target_context_pct}% age=${resp.target_observed_age_ms ?? 0}ms`
+				: "";
 			return {
 				content: [{
 					type: "text" as const,
-					text: `coms_net_send → ${params.target}\nmsg_id ${msg_id}\nhops ${hops}`,
+					text: `coms_net_send → ${params.target}\nmsg_id ${msg_id}\nhops ${hops}${stateLine}`,
 				}],
-				details: { msg_id, target: params.target, target_session, hops },
+				details: {
+					msg_id,
+					target: params.target,
+					target_session,
+					hops,
+					target_context_pct: resp.target_context_pct,
+					target_status: resp.target_status,
+					target_observed_age_ms: resp.target_observed_age_ms,
+				},
 			};
 		},
 		renderCall(args, theme) {

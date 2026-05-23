@@ -146,6 +146,9 @@ export interface SendResponse {
 	msg_id: string;
 	status: "queued" | "delivered" | "complete" | "error" | "timeout";
 	target_session: string;
+	target_context_pct?: number;
+	target_status?: "online" | "stale" | "offline";
+	target_observed_age_ms?: number;
 }
 
 export interface ResponseSubmitRequest {

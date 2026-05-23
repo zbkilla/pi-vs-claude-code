@@ -263,6 +263,9 @@ function handleInboundPrompt(data: any): void {
 			typeof data.summary === "string" && data.summary.length > 0
 				? data.summary.slice(0, 200)
 				: null,
+		sender_context_pct: typeof sender.context_pct === "number" ? sender.context_pct : undefined,
+		sender_status: typeof sender.status === "string" ? sender.status : undefined,
+		sender_observed_age_ms: typeof sender.observed_age_ms === "number" ? sender.observed_age_ms : undefined,
 		hops: typeof data.hops === "number" ? data.hops : 0,
 		response_schema:
 			data.response_schema && typeof data.response_schema === "object"
@@ -312,10 +315,17 @@ function handleInboundResponse(data: any): void {
 		? responseVal
 		: (responseVal != null ? JSON.stringify(responseVal, null, 2) : "");
 	if (!bodyText) return;
+	const responderState = data?.responder && typeof data.responder === "object"
+		? {
+			context_pct: typeof data.responder.context_pct === "number" ? data.responder.context_pct : undefined,
+			status: typeof data.responder.status === "string" ? data.responder.status : undefined,
+			observed_age_ms: typeof data.responder.observed_age_ms === "number" ? data.responder.observed_age_ms : undefined,
+		}
+		: undefined;
 	setTimeout(() => {
 		const stillPending = pendingReplies.get(msg_id);
 		if (stillPending?.consumedByAwait) return;
-		pushReplyChannel(msg_id, responderName, bodyText)
+		pushReplyChannel(msg_id, responderName, bodyText, responderState)
 			.then((ok) => { if (ok) log("reply_pushed", { msg_id }); });
 	}, 150);
 }
@@ -358,18 +368,21 @@ server.server.oninitialized = () => {
 async function pushChannel(entry: InboxEntry): Promise<boolean> {
 	if (!mcpInitialized) return false;
 	try {
+		const meta: Record<string, any> = {
+			sender: entry.sender_name,
+			thread: entry.sender_session,
+			msg_id: entry.msg_id,
+			summary: entry.summary ?? entry.prompt.slice(0, 200),
+		};
+		// Stamp sender peer-state on the channel meta so CC renders
+		// <channel ... sender_context_pct="..." sender_status="..." ...>.
+		// Receivers read raw values; threshold decisions are end-to-end.
+		if (typeof entry.sender_context_pct === "number") meta.sender_context_pct = entry.sender_context_pct;
+		if (typeof entry.sender_status === "string") meta.sender_status = entry.sender_status;
+		if (typeof entry.sender_observed_age_ms === "number") meta.sender_observed_age_ms = entry.sender_observed_age_ms;
 		await server.server.notification({
 			method: "notifications/claude/channel",
-			params: {
-				content: entry.prompt,
-				meta: {
-					sender: entry.sender_name,
-					thread: entry.sender_session,
-					msg_id: entry.msg_id,
-					// Prefer sender-supplied summary; fall back to auto-sliced prompt.
-					summary: entry.summary ?? entry.prompt.slice(0, 200),
-				},
-			},
+			params: { content: entry.prompt, meta },
 		});
 		return true;
 	} catch (err) {
@@ -389,20 +402,24 @@ async function pushReplyChannel(
 	originalMsgId: string,
 	senderName: string,
 	body: string,
+	responder?: { context_pct?: number; status?: string; observed_age_ms?: number },
 ): Promise<boolean> {
 	if (!mcpInitialized) return false;
 	try {
+		const meta: Record<string, any> = {
+			sender: senderName,
+			reply_to: originalMsgId,
+			msg_id: originalMsgId,
+			summary: body.slice(0, 200),
+		};
+		// Responder peer-state — flagged in design synthesis as the highest-value
+		// signal (sender learns whether the answerer was healthy).
+		if (responder && typeof responder.context_pct === "number") meta.responder_context_pct = responder.context_pct;
+		if (responder && typeof responder.status === "string") meta.responder_status = responder.status;
+		if (responder && typeof responder.observed_age_ms === "number") meta.responder_observed_age_ms = responder.observed_age_ms;
 		await server.server.notification({
 			method: "notifications/claude/channel",
-			params: {
-				content: body,
-				meta: {
-					sender: senderName,
-					reply_to: originalMsgId,
-					msg_id: originalMsgId,
-					summary: body.slice(0, 200),
-				},
-			},
+			params: { content: body, meta },
 		});
 		return true;
 	} catch (err) {
@@ -509,7 +526,11 @@ server.registerTool(
 			return {
 				content: [{
 					type: "text" as const,
-					text: `coms_net_send → ${target}\nmsg_id ${resp.msg_id}\nstatus ${resp.status}`,
+					text:
+						`coms_net_send → ${target}\nmsg_id ${resp.msg_id}\nstatus ${resp.status}` +
+						(typeof resp.target_context_pct === "number"
+							? `\ntarget_state ${resp.target_status ?? "?"} ctx=${resp.target_context_pct}% age=${resp.target_observed_age_ms ?? 0}ms`
+							: ""),
 				}],
 			};
 		} catch (err) {
