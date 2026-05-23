@@ -266,6 +266,12 @@ function handleInboundPrompt(data: any): void {
 	} catch (err) {
 		appendErrorLog(stateDir, `writeInbox failed for ${msg_id}: ${String(err)}`);
 	}
+	// Also try to push as a claude/channel notification for low-latency delivery.
+	// Inbox remains the source of truth — Stop hook drains it on next turn
+	// regardless of whether the channel push landed.
+	pushChannel(entry).then((pushed) => {
+		if (pushed) log("channel_pushed", { msg_id });
+	});
 }
 
 function handleInboundResponse(data: any): void {
@@ -286,7 +292,60 @@ function handleInboundResponse(data: any): void {
 
 // ━━ MCP server + tools ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-const server = new McpServer({ name: "coms-net", version: "0.1.0" });
+const server = new McpServer(
+	{ name: "coms-net", version: "0.1.0" },
+	{
+		instructions:
+			`You are CC peer "${identity.name}" on the coms-net hub (project "${identity.project}"). ` +
+			`Inbound messages from other agents arrive as <channel source="coms-net" sender="..." msg_id="..." thread="..." summary="...">body</channel> events. ` +
+			`React inline — write a normal assistant message, and the Stop hook auto-submits your final text back to the sender. ` +
+			`DO NOT call coms_net_send to reply to channel messages (that creates a ping-pong loop). ` +
+			`Use coms_net_send / coms_net_await only to INITIATE new outbound conversations.`,
+	},
+);
+
+// Declare the experimental claude/channel capability so Claude Code opens
+// the push channel for this MCP. Must be registered before connect().
+server.server.registerCapabilities({
+	experimental: { "claude/channel": {} },
+});
+
+// Gate channel emissions on notifications/initialized — per MCP spec, the
+// server must not send notifications before the client signals initialized.
+// Claude Code drops anything that arrives early (see droplet's
+// respawn-channel-race-2026-05-14.md).
+let mcpInitialized = false;
+server.server.oninitialized = () => {
+	mcpInitialized = true;
+	log("mcp_initialized", {});
+};
+
+/**
+ * Push an inbound prompt as a claude/channel notification. Falls back
+ * silently if the channel isn't ready yet — the inbox file written by the
+ * SSE handler is the second-tier delivery path (Stop hook will drain it).
+ */
+async function pushChannel(entry: InboxEntry): Promise<boolean> {
+	if (!mcpInitialized) return false;
+	try {
+		await server.server.notification({
+			method: "notifications/claude/channel",
+			params: {
+				content: entry.prompt,
+				meta: {
+					sender: entry.sender_name,
+					thread: entry.sender_session,
+					msg_id: entry.msg_id,
+					summary: entry.prompt.slice(0, 200),
+				},
+			},
+		});
+		return true;
+	} catch (err) {
+		log("channel_push_failed", { msg_id: entry.msg_id, error: String(err) });
+		return false;
+	}
+}
 
 function notReady(): { content: { type: "text"; text: string }[]; isError: true } {
 	return {

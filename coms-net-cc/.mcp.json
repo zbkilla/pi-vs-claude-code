@@ -1,9 +1,3 @@
 {
-  "mcpServers": {
-    "coms-net": {
-      "command": "bun",
-      "args": ["run", "${CLAUDE_PLUGIN_ROOT}/server/index.ts"],
-      "env": {}
-    }
-  }
+  "mcpServers": {}
 }
