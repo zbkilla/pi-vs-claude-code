@@ -1,0 +1,11 @@
+{
+  "name": "pi-vs-cc",
+  "owner": { "name": "zbk" },
+  "plugins": [
+    {
+      "name": "coms-net-cc",
+      "source": "./coms-net-cc",
+      "description": "Peer Claude Code sessions with Pi agents over the coms-net HTTP/SSE hub"
+    }
+  ]
+}

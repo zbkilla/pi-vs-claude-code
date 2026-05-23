@@ -1,0 +1,8 @@
+{
+  "name": "coms-net-cc",
+  "version": "0.1.0",
+  "description": "Bridge Claude Code into the coms-net hub so it can peer with Pi Coding Agent sessions",
+  "author": { "name": "zbk" },
+  "license": "MIT",
+  "keywords": ["pi", "coms-net", "agents", "p2p"]
+}
