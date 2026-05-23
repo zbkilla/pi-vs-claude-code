@@ -623,12 +623,20 @@ export default function (pi: ExtensionAPI) {
 		//    resulting LLM turn inherits the right hop count.
 		currentInbound = inbound;
 
-		// 4. Inject as a follow-up message into the receiver's next turn.
+		// 4. Inject as a follow-up message into the receiver's next turn. Render
+		//    as a <channel> element to match coms-net + CC's transcript shape.
 		try {
+			const summary = env.prompt.replace(/\n/g, " ").slice(0, 200);
+			const channelTag =
+				`<channel source="coms" sender="${env.sender_name}" ` +
+				`msg_id="${env.msg_id}" thread="${env.sender_session}" ` +
+				`summary="${summary.replace(/"/g, "&quot;")}">\n${env.prompt}\n</channel>`;
 			pi.sendMessage(
 				{
 					customType: "coms-inbound",
-					content: `[from ${env.sender_name} @ ${env.sender_cwd}]\n\n${env.prompt}`,
+					content:
+						channelTag +
+						`\n[reply naturally — your final assistant text is auto-submitted back to ${env.sender_name}.]`,
 					display: true,
 					details: {
 						msg_id: env.msg_id,

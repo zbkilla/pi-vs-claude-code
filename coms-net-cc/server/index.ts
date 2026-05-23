@@ -392,7 +392,7 @@ server.registerTool(
 		description:
 			"INITIATE a new outbound message to a peer agent. Returns synchronously with a msg_id " +
 			"once the server queues the prompt. Use coms_net_get/await with the msg_id to retrieve the reply.\n\n" +
-			"DO NOT call this to REPLY to an inbound `[from <peer>] …` prompt — just write your answer as a " +
+			"DO NOT call this to REPLY to an inbound `<channel source=\"coms-net\" sender=\"<peer>\" msg_id=\"…\">` prompt — just write your answer as a " +
 			"normal assistant message; the Stop hook auto-captures it and submits back to the caller. " +
 			"Calling coms_net_send to reply creates a ping-pong loop.",
 		inputSchema: {
@@ -464,7 +464,7 @@ server.registerTool(
 		description:
 			"Non-blocking poll of a reply to YOUR OWN coms_net_send. Returns status pending|complete|error " +
 			"and (when complete) the response. Only use msg_ids returned by coms_net_send, never msg_ids from " +
-			"inbound `[from <peer>] …` prompts — those belong to the peer.",
+			"inbound `<channel source=\"coms-net\" sender=\"<peer>\" msg_id=\"…\">` prompts — those belong to the peer.",
 		inputSchema: { msg_id: z.string() },
 	},
 	async ({ msg_id }) => {

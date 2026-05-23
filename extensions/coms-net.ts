@@ -144,6 +144,10 @@ interface PendingReply {
 	target_name?: string;
 	target_session?: string;
 	created_at: string;
+	/** Set true when coms_net_await consumes the reply, so the auto-deliver
+	 *  followUp turn is suppressed (avoids the LLM seeing the same response
+	 *  twice — once as tool result, once as a new turn). */
+	consumedByAwait?: boolean;
 }
 
 interface ServerJson {
@@ -674,15 +678,21 @@ export default function (pi: ExtensionAPI) {
 		currentInbound = inbound;
 
 		try {
+			// Render as a <channel> element matching CC's transcript shape so
+			// pi↔CC conversations look the same regardless of which side reads them.
+			// Reply guidance is intentionally one short line — the coms_net_send
+			// tool description carries the full warning.
+			const summary = promptText.replace(/\n/g, " ").slice(0, 200);
+			const channelTag =
+				`<channel source="coms-net" sender="${senderName}" ` +
+				`msg_id="${msg_id}" thread="${senderSession}" ` +
+				`summary="${summary.replace(/"/g, "&quot;")}">\n${promptText}\n</channel>`;
 			pi.sendMessage(
 				{
 					customType: "coms-net-inbound",
 					content:
-						`[inbound coms-net message from ${senderName} @ ${senderCwd}]\n` +
-						`[reply by writing a normal assistant message — your turn output is auto-returned to ${senderName}. ` +
-						`DO NOT call coms_net_send/coms_net_await/coms_net_get to reply; that creates a ping-pong loop. ` +
-						`msg_id ${msg_id} belongs to ${senderName}'s outbound, not yours.]\n\n` +
-						`${promptText}`,
+						channelTag +
+						`\n[reply naturally — your final assistant text is auto-submitted back to ${senderName}.]`,
 					display: true,
 					details: {
 						msg_id,
@@ -728,6 +738,59 @@ export default function (pi: ExtensionAPI) {
 			} catch { /* best-effort */ }
 		} else {
 			audit("orphan_response", { msg_id });
+		}
+
+		// Auto-deliver the reply as a followUp turn so the agent sees it inline
+		// without needing an explicit coms_net_await. coms_net_await still works
+		// for blockers that want the value as a tool result; this is parallel.
+		// Suppressed when:
+		//   • the response is an error (no useful body to render), OR
+		//   • coms_net_await consumed the reply (avoid double-delivery to the LLM).
+		//
+		// Small delay so that if coms_net_await is called within ~150ms of the
+		// SSE response arriving (the await tool's promise resolves on the same
+		// tick), we see the flag set in time and skip the followUp.
+		if (errVal) return;
+		if (pending?.consumedByAwait) return;
+		setTimeout(() => {
+			const stillPending = pendingReplies.get(msg_id);
+			if (stillPending?.consumedByAwait) return;
+			deliverReplyFollowUp(msg_id, responseVal, stillPending, data);
+		}, 150);
+	}
+
+	function deliverReplyFollowUp(
+		msg_id: string,
+		responseVal: any,
+		pending: PendingReply | undefined,
+		data: any,
+	): void {
+		const responderName =
+			(data?.responder && typeof data.responder.name === "string")
+				? data.responder.name
+				: (pending?.target_name ?? "peer");
+		const bodyText = typeof responseVal === "string"
+			? responseVal
+			: (responseVal != null ? JSON.stringify(responseVal, null, 2) : "");
+		if (!bodyText) return;
+		const summary = bodyText.replace(/\n/g, " ").slice(0, 200);
+		const channelTag =
+			`<channel source="coms-net" sender="${responderName}" ` +
+			`reply_to="${msg_id}" summary="${summary.replace(/"/g, "&quot;")}">\n${bodyText}\n</channel>`;
+		try {
+			pi.sendMessage(
+				{
+					customType: "coms-net-reply",
+					content:
+						channelTag +
+						`\n[this is ${responderName}'s reply to your earlier coms_net_send msg_id ${msg_id}. respond or move on as you like.]`,
+					display: true,
+					details: { msg_id, sender_name: responderName, kind: "reply" },
+				},
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+		} catch (err) {
+			audit("reply_followup_failed", { msg_id, reason: safeError(err) });
 		}
 	}
 
@@ -1186,7 +1249,7 @@ export default function (pi: ExtensionAPI) {
 			"Returns synchronously with a msg_id once the server queues the prompt. " +
 			"Use coms_net_get (non-blocking) or coms_net_await (blocking) with that msg_id to retrieve the peer's reply.\n\n" +
 			"⚠️  DO NOT call this tool to REPLY to an inbound message. " +
-			"When you receive a `[from <peer>] …` follow-up, just write your answer as your normal assistant message — " +
+			"When you receive a `<channel source=\"coms-net\" sender=\"<peer>\" msg_id=\"…\">` inbound follow-up, just write your answer as your normal assistant message — " +
 			"the coms-net extension automatically captures the final assistant text at the end of your turn and " +
 			"submits it back to the original caller. Calling coms_net_send in response creates an infinite ping-pong loop.\n\n" +
 			"Only valid uses: (a) you, the user, or your task explicitly ask to start a new conversation with a peer; " +
@@ -1297,7 +1360,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Coms Net Get",
 		description:
 			"Non-blocking poll of a reply to YOUR OWN coms_net_send. Returns status pending|complete|error and (when complete) the response. " +
-			"Same caveat as coms_net_await: only use msg_ids you got back from coms_net_send, never msg_ids from an inbound `[from <peer>] …` prompt — " +
+			"Same caveat as coms_net_await: only use msg_ids you got back from coms_net_send, never msg_ids from an inbound `<channel source=\"coms-net\" sender=\"<peer>\" msg_id=\"…\">` inbound prompt — " +
 			"those belong to the peer, and replying to them happens automatically via your normal assistant message at end of turn.",
 		parameters: Type.Object({
 			msg_id: Type.String({ description: "msg_id returned by coms_net_send." }),
@@ -1370,7 +1433,7 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Block until the reply to YOUR OWN outbound coms_net_send arrives, or the timeout fires (default 30 min). " +
 			"Only call this with a msg_id that YOU received as the return value of a coms_net_send call you just made.\n\n" +
-			"⚠️  Do NOT call this with a msg_id that came in via an inbound `[from <peer>] …` prompt — those msg_ids belong to the *peer's* outbound, not yours. " +
+			"⚠️  Do NOT call this with a msg_id that came in via an inbound `<channel source=\"coms-net\" sender=\"<peer>\" msg_id=\"…\">` inbound prompt — those msg_ids belong to the *peer's* outbound, not yours. " +
 			"To reply to an inbound message, do nothing special: just answer normally as your assistant message, " +
 			"and the extension will auto-submit your final text back to the caller when your turn ends.",
 		parameters: Type.Object({
@@ -1385,6 +1448,12 @@ export default function (pi: ExtensionAPI) {
 
 			// Local SSE-resolved fast path.
 			const pending = pendingReplies.get(msg_id);
+			if (pending) {
+				// Mark as consumed so handleInboundResponse skips the auto-deliver
+				// followUp (whether the result is already here or arrives during
+				// the race below — flag is checked at delivery time).
+				pending.consumedByAwait = true;
+			}
 			if (pending && pending.result) {
 				const r = pending.result;
 				if (r.error) {
